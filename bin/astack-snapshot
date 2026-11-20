@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# astack-snapshot: record what this machine runs in stack.lock.json.
+#   astack-snapshot             write the lock
+#   astack-snapshot --check     compare only; exit 1 and show the diff on drift
+#   astack-snapshot --upgrades  list plugins whose marketplace offers a newer version
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK="$REPO/stack.lock.json"
+P="$HOME/.claude/plugins"
+
+if [ "${1:-}" = "--upgrades" ]; then
+  claude plugin marketplace update >/dev/null
+  for id in $(jq -r '.plugins | keys[]' "$LOCK"); do
+    claude plugin install "$id" --json |
+      jq -r 'select(.availableVersion and .availableVersion != .installedVersion) | "\(.pluginId) \(.installedVersion) -> \(.availableVersion)"'
+  done
+  exit 0
+fi
+
+# Directory entries as a JSON array of names (skills are dirs, agents are .md files).
+names() { find "$@" -mindepth 1 -maxdepth 1 ! -name '.*' ! -name '*.json' ! -name synced 2>/dev/null |
+  xargs -n1 basename 2>/dev/null | sed 's/\.md$//' | sort -u | jq -R . | jq -s .; }
+
+snapshot() {
+  jq -n \
+    --slurpfile mk "$P/known_marketplaces.json" \
+    --slurpfile ip "$P/installed_plugins.json" \
+    --argjson skills "$(names "$REPO/claude/skills")" \
+    --argjson agents "$(names "$REPO/claude/agents")" \
+    --argjson synced_skills "$(names "$HOME"/.claude/skills/synced/*/)" \
+    --argjson synced_plugins "$(cat "$P"/synced/*/manifest.json 2>/dev/null | jq -s '[.[].plugins[] | {
+        name: (if (.name | test("^[0-9a-f-]{36}$")) then (.description | split(" ")[0]) else .name end),
+        marketplace: .marketplaceName, version }] | sort_by(.name)')" \
+    '{
+      marketplaces: ($mk[0] | map_values(.source.repo // .source.url)),
+      plugins: ($ip[0].plugins | map_values(.[0] | {version, sha: .gitCommitSha})),
+      skills: $skills,
+      agents: $agents,
+      account_synced: {plugins: $synced_plugins, skills: $synced_skills}
+    }'
+}
+
+if [ "${1:-}" = "--check" ]; then
+  diff -u "$LOCK" <(snapshot) && echo "no drift"
+else
+  snapshot > "$LOCK"
+  echo "wrote $LOCK"
+fi
