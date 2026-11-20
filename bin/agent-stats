@@ -3,10 +3,12 @@
 #   agent-stats              print tables for this machine
 #   agent-stats --with HOST  also run it on HOST over ssh and show both
 #   agent-stats --json       print one JSON line per machine (for a daily log)
-# Sessions are transcript files written to inside the window. Hours count
-# 5-minute slots with a model call: active hours once per slot, agent hours
-# once per session per slot. PR counts come from GitHub, so they cover every
-# machine; the rest covers the machine it runs on.
+#   agent-stats --days N     print one JSON line per machine per local day, last N days, today included
+# Sessions are transcript files written to inside the window (with --days:
+# files with a model call that day). Hours count 5-minute slots with a model
+# call: active hours once per slot, agent hours once per session per slot. PR
+# counts come from GitHub, so they cover every machine; the rest covers the
+# machine it runs on.
 set -euo pipefail
 
 C="$HOME/.claude/projects" X="$HOME/.codex/sessions" DAY=1440 WEEK=10080
@@ -17,56 +19,60 @@ files() { [ -d "$1" ] || return 0; find "$1" -name '*.jsonl' -mmin -"$2" "${@:3}
 prs() { gh search prs --author=@me --limit 1000 --json number -q length "$@"; }
 ago() { jq -nr --argjson m "$1" 'now - $m * 60 | todate'; }
 
-# One line per model call in the last week (Claude replies, Codex turns), tagged with its file.
+# One line per model call in the last $1 minutes (Claude replies, Codex turns), tagged with its file.
 events() {
-  files "$C" $WEEK -exec env LC_ALL=C awk 'index($0, "\"usage\"") {print FILENAME "\t" $0}' {} + &&
-  files "$X" $WEEK -exec env LC_ALL=C awk 'index($0, "\"token_count\"") {print FILENAME "\t" $0}' {} +
+  files "$C" "$1" -exec env LC_ALL=C awk 'index($0, "\"usage\"") {print FILENAME "\t" $0}' {} + &&
+  files "$X" "$1" -exec env LC_ALL=C awk 'index($0, "\"token_count\"") {print FILENAME "\t" $0}' {} +
 }
+# jq: one tagged line -> {f, ts, id, out, in, cr} for Claude or {f, ts, id, codex} for Codex.
+CALLS='index("\t") as $i | .[:$i] as $f | .[$i + 1:] | fromjson |
+  if .type == "assistant" and .message.usage then .message.usage as $u |
+    # One API reply is logged once per content block: key it by message.id.
+    {f: $f, ts: .timestamp, id: (.message.id // "\($f) \(.timestamp)"), out: ($u.output_tokens // 0),
+     in: (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)), cr: ($u.cache_read_input_tokens // 0)}
+  elif .payload.type == "token_count" and .payload.info then
+    # Codex logs a running total per turn, sometimes twice: key it by that total.
+    {f: $f, ts: .timestamp, id: "\($f) \(.payload.info.total_token_usage.total_tokens)",
+     codex: .payload.info.last_token_usage.total_tokens}
+  else empty end'
+# jq: a list of calls -> tokens and hours.
+STATS='def hours: length / 12 * 10 | round / 10;
+  def stats: unique_by(.id) | map(.slot = (.ts[:19] + "Z" | fromdate / 300 | floor)) |
+    map(select(.codex == null)) as $c | {
+      output_tokens: ($c | map(.out) | add // 0), input_tokens: ($c | map(.in) | add // 0),
+      cache_read_tokens: ($c | map(.cr) | add // 0), codex_tokens: (map(.codex // 0) | add // 0),
+      active_hours: (map(.slot) | unique | hours), agent_hours: (map([.f, .slot]) | unique | hours)}
+    | .total_tokens = .output_tokens + .input_tokens + .cache_read_tokens + .codex_tokens;'
 
 # Tokens and hours for both windows, from one scan.
 usage() {
   set -e   # bash turns errexit off inside $(...); a failed step must not print partial totals
-  events | jq -Rc 'index("\t") as $i | .[:$i] as $f | .[$i + 1:] | fromjson |
-    if .type == "assistant" and .message.usage then .message.usage as $u |
-      # One API reply is logged once per content block: key it by message.id.
-      {f: $f, ts: .timestamp, id: (.message.id // "\($f) \(.timestamp)"), out: ($u.output_tokens // 0),
-       in: (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)), cr: ($u.cache_read_input_tokens // 0)}
-    elif .payload.type == "token_count" and .payload.info then
-      # Codex logs a running total per turn, sometimes twice: key it by that total.
-      {f: $f, ts: .timestamp, id: "\($f) \(.payload.info.total_token_usage.total_tokens)",
-       codex: .payload.info.last_token_usage.total_tokens}
-    else empty end' |
-  jq -s --arg d "$(ago $DAY)" --arg w "$(ago $WEEK)" '
-    def hours: length / 12 * 10 | round / 10;
-    def stats($since): map(select(.ts >= $since)) | unique_by(.id) | map(.slot = (.ts[:19] + "Z" | fromdate / 300 | floor)) |
-      map(select(.codex == null)) as $c | {
-        output_tokens: ($c | map(.out) | add // 0), input_tokens: ($c | map(.in) | add // 0),
-        cache_read_tokens: ($c | map(.cr) | add // 0), codex_tokens: (map(.codex // 0) | add // 0),
-        active_hours: (map(.slot) | unique | hours), agent_hours: (map([.f, .slot]) | unique | hours)}
-      | .total_tokens = .output_tokens + .input_tokens + .cache_read_tokens + .codex_tokens;
-    {"24h": stats($d), "7d": stats($w)}'
+  events $WEEK | jq -Rc "$CALLS" |
+  jq -s --arg d "$(ago $DAY)" --arg w "$(ago $WEEK)" "$STATS"'
+    {"24h": (map(select(.ts >= $d)) | stats), "7d": (map(select(.ts >= $w)) | stats)}'
 }
 
-# Crashes, OOM kills and system errors in the last $1 minutes.
-health() {
+# Crashes, OOM kills and system errors in the last $1 minutes, one JSON line {k, t} each.
+health_events() {
   set -e
-  local min=$1 since crashes oom errors=null d
+  local min=$1 since d
   if [ "$OS" = Darwin ]; then
     # The unified log has millions of error lines a day; crash and Jetsam reports are the signal.
-    reports() { for d in /Library/Logs/DiagnosticReports "$HOME/Library/Logs/DiagnosticReports"; do
-      if [ -d "$d" ]; then find "$d" -maxdepth 1 -name '*.ips' -mmin -"$min" "$@"; fi; done | wc -l; }
-    crashes=$(reports ! -name 'JetsamEvent*')
-    oom=$(reports -name 'JetsamEvent*')
+    for d in /Library/Logs/DiagnosticReports "$HOME/Library/Logs/DiagnosticReports"; do
+      if [ -d "$d" ]; then find "$d" -maxdepth 1 -name '*.ips' -mmin -"$min" -exec stat -f '%m %N' {} +; fi
+    done | awk '{print "{\"k\":\"" ($0 ~ /JetsamEvent/ ? "oom" : "crash") "\",\"t\":" $1 "}"}'
   else
     since="@$(jq -n --argjson m "$min" 'now - $m * 60 | floor')"
-    crashes=$(journalctl -q -o json --since "$since" MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1 | wc -l)
-    oom=$(journalctl -q -o cat --since "$since" _TRANSPORT=kernel + _SYSTEMD_UNIT=systemd-oomd.service |
-      awk '/Killed process|Killed .* due to/ {n++} END {print n + 0}')
-    errors=$(journalctl -q -o json -p err --since "$since" | wc -l)
+    journalctl -q -o short-unix --since "$since" MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1 |
+      awk '/^[0-9]/ {print "{\"k\":\"crash\",\"t\":" int($1) "}"}'
+    journalctl -q -o short-unix --since "$since" _TRANSPORT=kernel + _SYSTEMD_UNIT=systemd-oomd.service |
+      awk '/^[0-9]/ && /Killed process|Killed .* due to/ {print "{\"k\":\"oom\",\"t\":" int($1) "}"}'
+    journalctl -q -o short-unix -p err --since "$since" | awk '/^[0-9]/ {print "{\"k\":\"error\",\"t\":" int($1) "}"}'
   fi
-  jq -n '{crashes: $ARGS.positional[0], oom_kills: $ARGS.positional[1], system_errors: $ARGS.positional[2]}' \
-    --jsonargs "$crashes" "$oom" "$errors"
 }
+# jq: a list of health events -> counts (no system errors on macOS).
+HEALTH='def health($os): {crashes: map(select(.k == "crash")) | length, oom_kills: map(select(.k == "oom")) | length,
+  system_errors: (if $os == "Darwin" then null else map(select(.k == "error")) | length end)};'
 
 # Counts that take one command per window.
 window() {
@@ -78,7 +84,7 @@ window() {
   codex=$(files "$X" "$min" | wc -l)
   opened=$(prs --created=">=$since")
   merged=$(prs --merged-at=">=$since")
-  h=$(health "$min")
+  h=$(health_events "$min" | jq -sc --arg os "$OS" "$HEALTH"'health($os)')
   jq -n --argjson h "$h" '{prs_opened: $ARGS.positional[0], prs_merged: $ARGS.positional[1],
     claude_sessions: $ARGS.positional[2], claude_subagents: $ARGS.positional[3],
     codex_sessions: $ARGS.positional[4]} + $h' --jsonargs "$opened" "$merged" "$sessions" "$subagents" "$codex"
@@ -112,19 +118,58 @@ stats() {
     '{at: (now | todate), host: $host, machine: $m, open_prs: $open, "24h": ($d + $u."24h"), "7d": ($w + $u."7d")}'
 }
 
-json=0 with=
+# PRs opened and merged in the last $1 days, one JSON line {k, u, t} each. GitHub search
+# returns at most 1000 results, so ask 10 days at a time (overlapping; the caller dedupes).
+day_prs() {
+  set -e
+  local i a b
+  for ((i = $1; i > 0; i -= 10)); do
+    a=$(jq -nr --argjson d $((i + 1)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
+    b=$(jq -nr --argjson d $((i - 11)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
+    gh search prs --author=@me --limit 1000 --created="$a..$b" --json url,createdAt --jq '.[] | {k: "opened", u: .url, t: .createdAt}'
+    gh search prs --author=@me --limit 1000 --merged-at="$a..$b" --json url,closedAt --jq '.[] | {k: "merged", u: .url, t: .closedAt}'
+  done
+}
+
+# One JSON line per local day for the last $1 days, today included, empty days too.
+daily() {
+  set -e
+  local n=$1 t host
+  host=$(hostname -s); t=$(mktemp -d); trap "rm -rf '$t'" EXIT
+  events $((n * DAY)) | jq -Rc "$CALLS" > "$t/calls"
+  day_prs "$n" > "$t/prs"
+  health_events $((n * DAY)) > "$t/health"
+  jq -nc --arg host "$host" --arg os "$OS" --argjson n "$n" \
+    --slurpfile c "$t/calls" --slurpfile p "$t/prs" --slurpfile h "$t/health" "$STATS$HEALTH"'
+    def day: strflocaltime("%Y-%m-%d");
+    def count($k): map(select(.k == $k)) | length;
+    def files(f): map(select(f) | .f) | unique | length;
+    ($c | map(.d = (.ts[:19] + "Z" | fromdate | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $calls |
+    ($p | unique_by([.k, .u]) | map(.d = (.t | fromdate | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $prs |
+    ($h | map(.d = (.t | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $health |
+    # Step back from noon UTC on today'"'"'s date, so a DST change never skips or repeats a day.
+    (now | day) as $today | range($n) | (($today + "T12:00:00Z" | fromdate) - . * 86400 | strftime("%Y-%m-%d")) as $d |
+    ($calls[$d] // []) as $x | ($prs[$d] // []) as $y |
+    {date: $d, host: $host, prs_opened: ($y | count("opened")), prs_merged: ($y | count("merged")),
+     claude_sessions: ($x | files(.codex == null and (.f | contains("/subagents/") | not))),
+     claude_subagents: ($x | files(.codex == null and (.f | contains("/subagents/")))),
+     codex_sessions: ($x | files(.codex != null))} + ($x | stats) + ($health[$d] // [] | health($os))'
+}
+
+json=0 with= days=
 while [ $# -gt 0 ]; do
   case $1 in
     --json) json=1 ;;
     --with) with=$2; shift ;;
-    *) echo "usage: agent-stats [--json] [--with HOST]" >&2; exit 2 ;;
+    --days) days=$2; shift ;;
+    *) echo "usage: agent-stats [--json | --days N] [--with HOST]" >&2; exit 2 ;;
   esac
   shift
 done
 
-lines=$(stats)
-if [ -n "$with" ]; then lines+=$'\n'$(ssh -o BatchMode=yes "$with" bash -s -- --json < "$0"); fi
-if [ $json = 1 ]; then echo "$lines"; exit 0; fi
+if [ -n "$days" ]; then mode=(--days "$days"); lines=$(daily "$days"); else mode=(--json); lines=$(stats); fi
+if [ -n "$with" ]; then lines+=$'\n'$(ssh -o BatchMode=yes "$with" bash -s -- "${mode[@]}" < "$0"); fi
+if [ $json = 1 ] || [ -n "$days" ]; then echo "$lines"; exit 0; fi
 
 jq -rs '
   def h: if . == null then "n/a" elif . >= 1e9 then "\(. / 1e8 | round / 10)B"

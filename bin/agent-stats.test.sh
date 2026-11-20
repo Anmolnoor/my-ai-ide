@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs agent-stats against a fake HOME and stub gh/ssh. Never touches the real HOME.
 set -euo pipefail
+export TZ=UTC   # --days buckets by local day
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 at() { jq -nr --argjson s "$1" '$s | todate'; }
 # T1 sits 60s into a 5-minute slot about 2 hours ago, so slot counts are stable.
@@ -26,11 +27,15 @@ EOF
 
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-case "$*" in *--created*) echo 4;; *--merged-at*) echo 3;; *--state=open*) echo 2;; *) exit 9;; esac
+case "$*" in
+  *createdAt*) echo "{\"k\":\"opened\",\"u\":\"pr1\",\"t\":\"$PR_AT\"}";;
+  *closedAt*) echo "{\"k\":\"merged\",\"u\":\"pr1\",\"t\":\"$PR_AT\"}";;
+  *--created*) echo 4;; *--merged-at*) echo 3;; *--state=open*) echo 2;; *) exit 9;; esac
 EOF
 # ssh -o BatchMode=yes HOST cmd...: run cmd here, against the same fake HOME.
 printf '#!/usr/bin/env bash\nshift 3; exec "$@"\n' > "$T/bin/ssh"
 chmod +x "$T/bin/gh" "$T/bin/ssh"
+export PR_AT; PR_AT=$(at "$T1")
 run() { HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" "$@"; }
 
 out="$(run --json)"
@@ -43,6 +48,15 @@ check '[."24h", ."7d"] | all(.crashes >= 0 and .oom_kills >= 0 and (.system_erro
 check '.machine | (.os | length > 0) and .cpus > 0 and .mem_total_gb > 0 and .mem_used_gb > 0 and .disk_free_gb > 0 and .uptime_hours > 0 and .load_1m >= 0'
 [ "$(run --with box --json | wc -l)" -eq 2 ] || { echo "FAIL: --with adds a line"; exit 1; }
 table=$(run --with box); grep -q 'Total tokens' <<<"$table" || { echo "FAIL: table"; exit 1; }
+# --days: one row per local day, empty days included; a PR found twice counts once.
+days="$(run --days 4)"; D1=$(jq -nr "$T1 | strftime(\"%Y-%m-%d\")"); D3=$(jq -nr "$OLD | strftime(\"%Y-%m-%d\")")
+dcheck() { jq -se --arg d1 "$D1" --arg d3 "$D3" "$1" <<<"$days" >/dev/null || { echo "FAIL: $1"; echo "$days"; exit 1; }; }
+dcheck 'length == 4 and (map(.date) | unique | length) == 4 and all(.host | length > 0)'
+dcheck 'map(select(.date == $d1))[0] | del(.date, .host, .crashes, .oom_kills, .system_errors) == {prs_opened:1, prs_merged:1, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:17, input_tokens:6, cache_read_tokens:100, codex_tokens:150, total_tokens:273, active_hours:0.2, agent_hours:0.3}'
+dcheck 'map(select(.date == $d3))[0] | {claude_sessions, claude_subagents, codex_sessions, output_tokens, total_tokens, active_hours} == {claude_sessions:1, claude_subagents:0, codex_sessions:0, output_tokens:20, total_tokens:222, active_hours:0.1}'
+dcheck 'map(select(.date != $d1 and .date != $d3)) | all(.total_tokens == 0 and .prs_opened == 0 and .crashes >= 0)'
+[ "$(run --days 12 | jq -s "map(.prs_opened) | add")" -eq 1 ] || { echo "FAIL: overlapping PR searches double-count"; exit 1; }
+[ "$(run --days 4 --with box | wc -l)" -eq 8 ] || { echo "FAIL: --days --with"; exit 1; }
 # An unreadable transcript must fail the run, not print partial totals.
 chmod 000 "$P/s1.jsonl"
 if run --json >/dev/null 2>&1; then echo "FAIL: a read error must fail the run"; exit 1; fi

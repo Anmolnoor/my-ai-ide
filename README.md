@@ -69,7 +69,7 @@ These live in my global `CLAUDE.md`:
 - [`bin/agent-stats`](bin/agent-stats): PRs, agent sessions, hours, tokens,
   crashes and machine health for the last 24 hours and 7 days. `--with HOST`
   adds another machine over ssh; `--json` prints one line per machine for a
-  daily log.
+  daily log; `--days N` prints one line per machine per day, for charts.
 - [`statusline-command.sh`](statusline-command.sh): a status line showing
   directory, git branch, model and context use.
 
