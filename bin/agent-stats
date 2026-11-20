@@ -60,7 +60,7 @@ health_events() {
     # The unified log has millions of error lines a day; crash and Jetsam reports are the signal.
     for d in /Library/Logs/DiagnosticReports "$HOME/Library/Logs/DiagnosticReports"; do
       if [ -d "$d" ]; then find "$d" -maxdepth 1 -name '*.ips' -mmin -"$min" -exec stat -f '%m %N' {} +; fi
-    done | awk '{print "{\"k\":\"" ($0 ~ /JetsamEvent/ ? "oom" : "crash") "\",\"t\":" $1 "}"}'
+    done | awk '{print "{\"k\":\"" ($0 ~ /\/JetsamEvent[^\/]*$/ ? "oom" : "crash") "\",\"t\":" $1 "}"}'
   else
     since="@$(jq -n --argjson m "$min" 'now - $m * 60 | floor')"
     journalctl -q -o short-unix --since "$since" MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1 |
@@ -136,15 +136,16 @@ daily() {
   set -e
   local n=$1 t host
   host=$(hostname -s); t=$(mktemp -d); trap "rm -rf '$t'" EXIT
-  events $((n * DAY)) | jq -Rc "$CALLS" > "$t/calls"
+  # Scan a day more than asked: a 25-hour day (DST) starts more than N x 24h ago.
+  events $(((n + 1) * DAY)) | jq -Rc "$CALLS" > "$t/calls"
   day_prs "$n" > "$t/prs"
-  health_events $((n * DAY)) > "$t/health"
+  health_events $(((n + 1) * DAY)) > "$t/health"
   jq -nc --arg host "$host" --arg os "$OS" --argjson n "$n" \
     --slurpfile c "$t/calls" --slurpfile p "$t/prs" --slurpfile h "$t/health" "$STATS$HEALTH"'
     def day: strflocaltime("%Y-%m-%d");
     def count($k): map(select(.k == $k)) | length;
     def files(f): map(select(f) | .f) | unique | length;
-    ($c | map(.d = (.ts[:19] + "Z" | fromdate | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $calls |
+    ($c | unique_by(.id) | map(.d = (.ts[:19] + "Z" | fromdate | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $calls |
     ($p | unique_by([.k, .u]) | map(.d = (.t | fromdate | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $prs |
     ($h | map(.d = (.t | day)) | group_by(.d) | map({(.[0].d): .}) | add // {}) as $health |
     # Step back from noon UTC on today'"'"'s date, so a DST change never skips or repeats a day.
@@ -161,7 +162,8 @@ while [ $# -gt 0 ]; do
   case $1 in
     --json) json=1 ;;
     --with) with=$2; shift ;;
-    --days) days=$2; shift ;;
+    --days) days=$2; shift
+      case $days in '' | *[!0-9]* | 0*) echo "agent-stats: --days needs a whole number of days, 1 or more" >&2; exit 2 ;; esac ;;
     *) echo "usage: agent-stats [--json | --days N] [--with HOST]" >&2; exit 2 ;;
   esac
   shift
