@@ -28,4 +28,8 @@ check '.open_prs == 2'
 check '."24h" == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:17, input_tokens:6, cache_read_tokens:100}'
 check '."7d"  == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:37, input_tokens:8, cache_read_tokens:300}'
 HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" | grep -q 'Output tokens' || { echo "FAIL: table"; exit 1; }
+# An unreadable transcript must fail the run, not print partial totals.
+chmod 000 "$P/s1.jsonl"
+if HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" --json >/dev/null 2>&1; then
+  echo "FAIL: a read error must fail the run"; exit 1; fi
 echo PASS
