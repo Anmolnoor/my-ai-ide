@@ -4,8 +4,9 @@ set -euo pipefail
 export TZ=UTC   # --days buckets by local day
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 at() { jq -nr --argjson s "$1" '$s | todate'; }
-# T1 sits 60s into a 5-minute slot about 2 hours ago, so slot counts are stable.
-T1=$(jq -n 'now - 7200 | . / 300 | floor * 300 + 60'); OLD=$(jq -n 'now - 259200 | floor')
+# T1 sits 60s into a 5-minute slot about 2 hours ago, so slot counts are stable,
+# and at least 7 minutes before midnight, so T1 + 400 stays on the same day.
+T1=$(jq -n 'now - 7200 | . / 300 | floor * 300 + 60 | if . % 86400 > 86400 - 420 then . - 900 else . end'); OLD=$(jq -n 'now - 259200 | floor')
 
 P="$T/home/.claude/projects/p1"; mkdir -p "$P/s1/subagents" "$T/home/.codex/sessions/2026" "$T/bin"
 # Two lines share message.id (one API call split across blocks): count it once.
