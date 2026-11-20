@@ -1,48 +1,142 @@
 #!/usr/bin/env bash
-# agent-stats: what my agents did on this machine in the last 24 hours and 7 days.
-#   agent-stats          print a table
-#   agent-stats --json   print one JSON object (one line, for a daily log)
-# Sessions are transcript files written to inside the window. PR counts come
-# from GitHub, so they cover every machine; the rest covers this machine only.
+# agent-stats: what my agents did in the last 24 hours and 7 days, and how the machine is doing.
+#   agent-stats              print tables for this machine
+#   agent-stats --with HOST  also run it on HOST over ssh and show both
+#   agent-stats --json       print one JSON line per machine (for a daily log)
+# Sessions are transcript files written to inside the window. Hours count
+# 5-minute slots with a model call: active hours once per slot, agent hours
+# once per session per slot. PR counts come from GitHub, so they cover every
+# machine; the rest covers the machine it runs on.
 set -euo pipefail
 
-C="$HOME/.claude/projects" X="$HOME/.codex/sessions"
+C="$HOME/.claude/projects" X="$HOME/.codex/sessions" DAY=1440 WEEK=10080
 
 # Transcript files written to in the last $2 minutes under dir $1; extra find args follow.
 files() { [ -d "$1" ] || return 0; find "$1" -name '*.jsonl' -mmin -"$2" "${@:3}"; }
 prs() { gh search prs --author=@me --limit 1000 --json number -q length "$@"; }
+ago() { jq -nr --argjson m "$1" 'now - $m * 60 | todate'; }
 
-window() {
+# One line per model call in the last week (Claude replies, Codex turns), tagged with its file.
+events() {
+  files "$C" $WEEK -exec env LC_ALL=C awk 'index($0, "\"usage\"") {print FILENAME "\t" $0}' {} + &&
+  files "$X" $WEEK -exec env LC_ALL=C awk 'index($0, "\"token_count\",\"info\":{") {print FILENAME "\t" $0}' {} +
+}
+
+# Tokens and hours for both windows, from one scan.
+usage() {
   set -e   # bash turns errexit off inside $(...); a failed step must not print partial totals
-  local min=$1 since sessions subagents codex tokens opened merged
-  since=$(jq -nr --argjson m "$min" 'now - $m * 60 | todate')
+  events | jq -Rc 'index("\t") as $i | .[:$i] as $f | .[$i + 1:] | fromjson |
+    if .type == "assistant" and .message.usage then .message.usage as $u |
+      # One API reply is logged once per content block: key it by message.id.
+      {f: $f, ts: .timestamp, id: (.message.id // "\($f) \(.timestamp)"), out: ($u.output_tokens // 0),
+       in: (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)), cr: ($u.cache_read_input_tokens // 0)}
+    elif .payload.type == "token_count" and .payload.info then
+      # Codex logs a running total per turn, sometimes twice: key it by that total.
+      {f: $f, ts: .timestamp, id: "\($f) \(.payload.info.total_token_usage.total_tokens)",
+       codex: .payload.info.last_token_usage.total_tokens}
+    else empty end' |
+  jq -s --arg d "$(ago $DAY)" --arg w "$(ago $WEEK)" '
+    def hours: length / 12 * 10 | round / 10;
+    def stats($since): map(select(.ts >= $since)) | unique_by(.id) | map(.slot = (.ts[:19] + "Z" | fromdate / 300 | floor)) |
+      map(select(.codex == null)) as $c | {
+        output_tokens: ($c | map(.out) | add // 0), input_tokens: ($c | map(.in) | add // 0),
+        cache_read_tokens: ($c | map(.cr) | add // 0), codex_tokens: (map(.codex // 0) | add // 0),
+        active_hours: (map(.slot) | unique | hours), agent_hours: (map([.f, .slot]) | unique | hours)}
+      | .total_tokens = .output_tokens + .input_tokens + .cache_read_tokens + .codex_tokens;
+    {"24h": stats($d), "7d": stats($w)}'
+}
+
+# Crashes, OOM kills and system errors in the last $1 minutes.
+health() {
+  set -e
+  local min=$1 since crashes oom errors=null d
+  if [ "$(uname -s)" = Darwin ]; then
+    # The unified log has millions of error lines a day; crash and Jetsam reports are the signal.
+    reports() { for d in /Library/Logs/DiagnosticReports "$HOME/Library/Logs/DiagnosticReports"; do
+      if [ -d "$d" ]; then find "$d" -maxdepth 1 -name '*.ips' -mmin -"$min" "$@"; fi; done | wc -l; }
+    crashes=$(reports ! -name 'JetsamEvent*')
+    oom=$(reports -name 'JetsamEvent*')
+  else
+    since="@$(jq -n --argjson m "$min" 'now - $m * 60 | floor')"
+    crashes=$(journalctl -q -o json --since "$since" MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1 | wc -l)
+    oom=$(journalctl -q -o cat --since "$since" _TRANSPORT=kernel + _SYSTEMD_UNIT=systemd-oomd.service |
+      awk '/Killed process|Killed .* due to/ {n++} END {print n + 0}')
+    errors=$(journalctl -q -o json -p err --since "$since" | wc -l)
+  fi
+  jq -n '{crashes: $ARGS.positional[0], oom_kills: $ARGS.positional[1], system_errors: $ARGS.positional[2]}' \
+    --jsonargs "$crashes" "$oom" "$errors"
+}
+
+# Counts that take one command per window.
+window() {
+  set -e
+  local min=$1 since sessions subagents codex opened merged h
+  since=$(ago "$min")
   sessions=$(files "$C" "$min" ! -path '*/subagents/*' | wc -l)
   subagents=$(files "$C" "$min" -path '*/subagents/*' | wc -l)
   codex=$(files "$X" "$min" | wc -l)
-  # One API reply is logged once per content block, so count each message.id once.
-  tokens=$(files "$C" "$min" -exec env LC_ALL=C sed -n '/"usage"/p' {} + |
-    jq -c --arg s "$since" 'select(.type == "assistant" and .timestamp >= $s and .message.usage) | {id: .message.id, u: .message.usage}' |
-    jq -s 'unique_by(.id) | map(.u) | {
-      output_tokens: (map(.output_tokens // 0) | add // 0),
-      input_tokens: (map((.input_tokens // 0) + (.cache_creation_input_tokens // 0)) | add // 0),
-      cache_read_tokens: (map(.cache_read_input_tokens // 0) | add // 0)}')
   opened=$(prs --created=">=$since")
   merged=$(prs --merged-at=">=$since")
-  jq -n --argjson t "$tokens" '{prs_opened: $ARGS.positional[0], prs_merged: $ARGS.positional[1],
+  h=$(health "$min")
+  jq -n --argjson h "$h" '{prs_opened: $ARGS.positional[0], prs_merged: $ARGS.positional[1],
     claude_sessions: $ARGS.positional[2], claude_subagents: $ARGS.positional[3],
-    codex_sessions: $ARGS.positional[4]} + $t' --jsonargs "$opened" "$merged" "$sessions" "$subagents" "$codex"
+    codex_sessions: $ARGS.positional[4]} + $h' --jsonargs "$opened" "$merged" "$sessions" "$subagents" "$codex"
 }
 
-open=$(prs --state=open); d=$(window 1440); w=$(window 10080)
-json=$(jq -nc --arg host "$(hostname -s)" --argjson open "$open" --argjson d "$d" --argjson w "$w" \
-  '{at: (now | todate), host: $host, open_prs: $open, "24h": $d, "7d": $w}')
+machine() {
+  set -e
+  local os cpus mem used up load
+  if [ "$(uname -s)" = Darwin ]; then
+    os="macOS $(sw_vers -productVersion)"; cpus=$(sysctl -n hw.ncpu); mem=$(sysctl -n hw.memsize)
+    used=$(vm_stat | awk -v p="$(sysctl -n hw.pagesize)" '/Pages active|Pages wired|occupied by compressor/ {n += $NF} END {print n * p}')
+    up=$(( $(date +%s) - $(sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\).*/\1/') ))
+    load=$(sysctl -n vm.loadavg | awk '{print $2}')
+  else
+    os=$(. /etc/os-release && echo "$PRETTY_NAME"); cpus=$(nproc)
+    read -r mem used < <(awk '/^MemTotal/ {t = $2} /^MemAvailable/ {a = $2} END {print t * 1024, (t - a) * 1024}' /proc/meminfo)
+    up=$(cut -d' ' -f1 /proc/uptime); load=$(cut -d' ' -f1 /proc/loadavg)
+  fi
+  jq -n --arg os "$os" '$ARGS.positional as [$cpus, $load, $up, $mem, $used, $free] |
+    def gb: . / 1073741824 * 10 | round / 10;
+    {os: $os, cpus: $cpus, load_1m: $load, uptime_hours: ($up / 360 | round / 10),
+     mem_used_gb: ($used | gb), mem_total_gb: ($mem | gb), disk_free_gb: ($free | gb)}' \
+    --jsonargs "$cpus" "$load" "$up" "$mem" "$used" "$(df -Pk "$HOME" | awk 'NR == 2 {print $4 * 1024}')"
+}
 
-if [ "${1:-}" = "--json" ]; then echo "$json"; exit 0; fi
-jq -r '
-  def row($label; $k): [$label, (."24h"[$k] | tostring), (."7d"[$k] | tostring)] | @tsv;
-  (["Last", "24h", "7d"] | @tsv),
-  row("PRs opened"; "prs_opened"), row("PRs merged"; "prs_merged"),
-  row("Claude sessions"; "claude_sessions"), row("Claude subagents"; "claude_subagents"),
-  row("Codex sessions"; "codex_sessions"), row("Output tokens"; "output_tokens"),
-  row("Input tokens"; "input_tokens"), row("Cache-read tokens"; "cache_read_tokens"),
-  "PRs open now\t\(.open_prs)"' <<<"$json" | column -t -s $'\t'
+stats() {
+  set -e
+  local open u d w m
+  open=$(prs --state=open); u=$(usage); d=$(window $DAY); w=$(window $WEEK); m=$(machine)
+  jq -nc --arg host "$(hostname -s)" --argjson open "$open" --argjson u "$u" --argjson d "$d" --argjson w "$w" --argjson m "$m" \
+    '{at: (now | todate), host: $host, machine: $m, open_prs: $open, "24h": ($d + $u."24h"), "7d": ($w + $u."7d")}'
+}
+
+json=0 with=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --json) json=1 ;;
+    --with) with=$2; shift ;;
+    *) echo "usage: agent-stats [--json] [--with HOST]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+lines=$(stats)
+if [ -n "$with" ]; then lines+=$'\n'$(ssh -o BatchMode=yes "$with" bash -s -- --json < "$0"); fi
+if [ $json = 1 ]; then echo "$lines"; exit 0; fi
+
+jq -rs '
+  def h: if . == null then "n/a" elif . >= 1e9 then "\(. / 1e8 | round / 10)B"
+    elif . >= 1e6 then "\(. / 1e5 | round / 10)M" elif . >= 1e4 then "\(. / 1e2 | round / 10)k" else tostring end;
+  . as $m | (["Last"] + [$m[] | "\(.host) 24h", "\(.host) 7d"] | @tsv),
+  ([["PRs opened", "prs_opened"], ["PRs merged", "prs_merged"], ["Claude sessions", "claude_sessions"],
+    ["Claude subagents", "claude_subagents"], ["Codex sessions", "codex_sessions"],
+    ["Active hours", "active_hours"], ["Agent hours", "agent_hours"], ["Total tokens", "total_tokens"],
+    ["Claude output", "output_tokens"], ["Claude input", "input_tokens"], ["Claude cache reads", "cache_read_tokens"],
+    ["Codex tokens", "codex_tokens"], ["Crashes", "crashes"], ["OOM kills", "oom_kills"], ["System errors", "system_errors"]][]
+    | . as [$label, $k] | [$label] + [$m[] | (."24h"[$k], ."7d"[$k]) | h] | @tsv),
+  (["PRs open now"] + [$m[] | (.open_prs | h), "-"] | @tsv)' <<<"$lines" | column -t -s $'\t'
+echo
+jq -rs '(["Machine", "OS", "Up", "Load", "CPUs", "Memory", "Disk free"] | @tsv),
+  (.[] | .machine as $x | [.host, $x.os, "\($x.uptime_hours)h", ($x.load_1m | tostring), ($x.cpus | tostring),
+    "\($x.mem_used_gb)/\($x.mem_total_gb) GB", "\($x.disk_free_gb) GB"] | @tsv)' <<<"$lines" | column -t -s $'\t'

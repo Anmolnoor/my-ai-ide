@@ -1,35 +1,49 @@
 #!/usr/bin/env bash
-# Runs agent-stats against a fake HOME and a stub gh. Never touches the real HOME.
+# Runs agent-stats against a fake HOME and stub gh/ssh. Never touches the real HOME.
 set -euo pipefail
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
-ago() { jq -nr --argjson s "$1" 'now - $s | todate'; }
+at() { jq -nr --argjson s "$1" '$s | todate'; }
+# T1 sits 60s into a 5-minute slot about 2 hours ago, so slot counts are stable.
+T1=$(jq -n 'now - 7200 | . / 300 | floor * 300 + 60'); OLD=$(jq -n 'now - 259200 | floor')
 
 P="$T/home/.claude/projects/p1"; mkdir -p "$P/s1/subagents" "$T/home/.codex/sessions/2026" "$T/bin"
 # Two lines share message.id (one API call split across blocks): count it once.
 # The 3-day-old line counts toward 7d only.
 cat > "$P/s1.jsonl" <<EOF
-{"type":"assistant","timestamp":"$(ago 3600)","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}
-{"type":"assistant","timestamp":"$(ago 3600)","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}
-{"type":"assistant","timestamp":"$(ago 259200)","message":{"id":"m2","usage":{"input_tokens":2,"output_tokens":20,"cache_read_input_tokens":200,"cache_creation_input_tokens":0}}}
+{"type":"assistant","timestamp":"$(at "$T1")","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}
+{"type":"assistant","timestamp":"$(at "$T1")","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}}
+{"type":"assistant","timestamp":"$(at "$OLD")","message":{"id":"m2","usage":{"input_tokens":2,"output_tokens":20,"cache_read_input_tokens":200,"cache_creation_input_tokens":0}}}
 EOF
-echo '{"type":"assistant","timestamp":"'"$(ago 60)"'","message":{"id":"m3","usage":{"input_tokens":0,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' > "$P/s1/subagents/a1.jsonl"
+echo '{"type":"assistant","timestamp":"'"$(at $((T1 + 30)))"'","message":{"id":"m3","usage":{"input_tokens":0,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' > "$P/s1/subagents/a1.jsonl"
 echo '{}' > "$P/old.jsonl"; touch -t "$(jq -nr 'now - 864000 | strftime("%Y%m%d%H%M")')" "$P/old.jsonl"
-echo '{}' > "$T/home/.codex/sessions/2026/c1.jsonl"
+# Codex logs a running total per turn, sometimes twice: count each total once.
+cat > "$T/home/.codex/sessions/2026/c1.jsonl" <<EOF
+{"timestamp":"$(at $((T1 + 60)))","type":"event_msg","payload":{"type":"token_count","info":null}}
+{"timestamp":"$(at $((T1 + 60)))","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":100}}}}
+{"timestamp":"$(at $((T1 + 61)))","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":100}}}}
+{"timestamp":"$(at $((T1 + 400)))","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":150},"last_token_usage":{"total_tokens":50}}}}
+EOF
 
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in *--created*) echo 4;; *--merged-at*) echo 3;; *--state=open*) echo 2;; *) exit 9;; esac
 EOF
-chmod +x "$T/bin/gh"
+# ssh -o BatchMode=yes HOST cmd...: run cmd here, against the same fake HOME.
+printf '#!/usr/bin/env bash\nshift 3; exec "$@"\n' > "$T/bin/ssh"
+chmod +x "$T/bin/gh" "$T/bin/ssh"
+run() { HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" "$@"; }
 
-out="$(HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" --json)"
+out="$(run --json)"
 check() { jq -e "$1" <<<"$out" >/dev/null || { echo "FAIL: $1"; echo "$out"; exit 1; }; }
 check '.open_prs == 2'
-check '."24h" == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:17, input_tokens:6, cache_read_tokens:100}'
-check '."7d"  == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:37, input_tokens:8, cache_read_tokens:300}'
-HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" | grep -q 'Output tokens' || { echo "FAIL: table"; exit 1; }
+# Slots: m1, m3 and the first Codex turn share one; the second Codex turn is the next.
+check '."24h" | del(.crashes, .oom_kills, .system_errors) == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:17, input_tokens:6, cache_read_tokens:100, codex_tokens:150, total_tokens:273, active_hours:0.2, agent_hours:0.3}'
+check '."7d"  | del(.crashes, .oom_kills, .system_errors) == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:37, input_tokens:8, cache_read_tokens:300, codex_tokens:150, total_tokens:495, active_hours:0.3, agent_hours:0.4}'
+check '[."24h", ."7d"] | all(.crashes >= 0 and .oom_kills >= 0 and (.system_errors == null or .system_errors >= 0))'
+check '.machine | (.os | length > 0) and .cpus > 0 and .mem_total_gb > 0 and .mem_used_gb > 0 and .disk_free_gb > 0 and .uptime_hours > 0 and .load_1m >= 0'
+[ "$(run --with box --json | wc -l)" -eq 2 ] || { echo "FAIL: --with adds a line"; exit 1; }
+table=$(run --with box); grep -q 'Total tokens' <<<"$table" || { echo "FAIL: table"; exit 1; }
 # An unreadable transcript must fail the run, not print partial totals.
 chmod 000 "$P/s1.jsonl"
-if HOME="$T/home" PATH="$T/bin:$PATH" "$(dirname "$0")/agent-stats" --json >/dev/null 2>&1; then
-  echo "FAIL: a read error must fail the run"; exit 1; fi
+if run --json >/dev/null 2>&1; then echo "FAIL: a read error must fail the run"; exit 1; fi
 echo PASS
