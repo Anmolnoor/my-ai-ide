@@ -162,8 +162,8 @@ while [ $# -gt 0 ]; do
   case $1 in
     --json) json=1 ;;
     --with) with=$2; shift ;;
-    --days) days=$2; shift
-      case $days in '' | *[!0-9]* | 0*) echo "agent-stats: --days needs a whole number of days, 1 or more" >&2; exit 2 ;; esac ;;
+    --days) days=${2-}; shift
+      case $days in '' | *[!0-9]* | 0* | ?????*) echo "agent-stats: --days needs a whole number of days, 1 to 9999" >&2; exit 2 ;; esac ;;
     *) echo "usage: agent-stats [--json | --days N] [--with HOST]" >&2; exit 2 ;;
   esac
   shift

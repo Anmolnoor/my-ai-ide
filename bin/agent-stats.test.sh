@@ -64,7 +64,8 @@ dcheck 'map(select(.date == $d3))[0] | {claude_sessions, claude_subagents, codex
 dcheck 'map(.codex_tokens) | add == 190'
 dcheck 'map(select(.date == $dm))[0].codex_tokens == 40'
 [ "$(run --days 12 | jq -s "map(.prs_opened) | add")" -eq 1 ] || { echo "FAIL: overlapping PR searches double-count"; exit 1; }
-for bad in 0 -1 x ""; do if run --days "$bad" >/dev/null 2>&1; then echo "FAIL: --days '$bad' accepted"; exit 1; fi; done
+for bad in 0 -1 x "" 10000; do if run --days "$bad" >/dev/null 2>&1; then echo "FAIL: --days '$bad' accepted"; exit 1; fi; done
+if run --days >/dev/null 2>&1; then echo "FAIL: bare --days accepted"; exit 1; fi
 [ "$(run --days 4 --with box | wc -l)" -eq 8 ] || { echo "FAIL: --days --with"; exit 1; }
 # An unreadable transcript must fail the run, not print partial totals.
 chmod 000 "$P/s1.jsonl"
