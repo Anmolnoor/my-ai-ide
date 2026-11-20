@@ -36,8 +36,8 @@ touch -t "$(jq -nr "$M + 60 | strftime(\"%Y%m%d%H%M\")")" "$T/home/.codex/sessio
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-  *createdAt*) echo "{\"k\":\"opened\",\"u\":\"pr1\",\"t\":\"$PR_AT\"}";;
-  *closedAt*) echo "{\"k\":\"merged\",\"u\":\"pr1\",\"t\":\"$PR_AT\"}";;
+  *createdAt*) jq -nc --argjson n "${PR_COUNT:-1}" '[range($n) | {url: "pr\(.)", createdAt: env.PR_AT}]';;
+  *closedAt*) jq -nc '[{url: "pr0", closedAt: env.PR_AT}]';;
   *--created*) echo 4;; *--merged-at*) echo 3;; *--state=open*) echo 2;; *) exit 9;; esac
 EOF
 # ssh -o BatchMode=yes HOST cmd...: run cmd here, against the same fake HOME.
@@ -64,9 +64,11 @@ dcheck 'map(select(.date == $d1))[0] | del(.date, .host, .crashes, .oom_kills, .
 dcheck 'map(select(.date == $d3))[0] | {claude_sessions, claude_subagents, codex_sessions, output_tokens, total_tokens, active_hours} == {claude_sessions:1, claude_subagents:0, codex_sessions:0, output_tokens:20, total_tokens:222, active_hours:0.1}'
 dcheck 'map(.codex_tokens) | add == 190'
 dcheck 'map(select(.date == $dm))[0].codex_tokens == 40'
-[ "$(run --days 12 | jq -s "map(.prs_opened) | add")" -eq 1 ] || { echo "FAIL: overlapping PR searches double-count"; exit 1; }
+[ "$(run --days 40 | jq -s "map(.prs_opened) | add")" -eq 1 ] || { echo "FAIL: overlapping PR searches double-count"; exit 1; }
 for bad in 0 -1 x "" 10000; do if run --days "$bad" >/dev/null 2>&1; then echo "FAIL: --days '$bad' accepted"; exit 1; fi; done
 if run --days >/dev/null 2>&1; then echo "FAIL: bare --days accepted"; exit 1; fi
+# A search that hits GitHub's 1000-result cap must fail, not undercount.
+if PR_COUNT=1000 run --days 4 >/dev/null 2>&1; then echo "FAIL: a capped PR search was accepted"; exit 1; fi
 [ "$(run --days 4 --with box | wc -l)" -eq 8 ] || { echo "FAIL: --days --with"; exit 1; }
 # An unreadable transcript must fail the run, not print partial totals.
 chmod 000 "$P/s1.jsonl"

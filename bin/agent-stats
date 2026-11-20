@@ -119,15 +119,16 @@ stats() {
 }
 
 # PRs opened and merged in the last $1 days, one JSON line {k, u, t} each. GitHub search
-# returns at most 1000 results, so ask 10 days at a time (overlapping; the caller dedupes).
+# returns at most 1000 results and allows 30 searches a minute, so ask 30 days at a time
+# (overlapping; the caller dedupes) and stop if a window hits the cap.
 day_prs() {
   set -e
-  local i a b
-  for ((i = $1; i > 0; i -= 10)); do
+  local i a b cap='if length >= 1000 then error("a GitHub search hit its 1000-result cap; counts would be short") else .[] end'
+  for ((i = $1; i > 0; i -= 30)); do
     a=$(jq -nr --argjson d $((i + 1)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
-    b=$(jq -nr --argjson d $((i - 11)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
-    gh search prs --author=@me --limit 1000 --created="$a..$b" --json url,createdAt --jq '.[] | {k: "opened", u: .url, t: .createdAt}'
-    gh search prs --author=@me --limit 1000 --merged-at="$a..$b" --json url,closedAt --jq '.[] | {k: "merged", u: .url, t: .closedAt}'
+    b=$(jq -nr --argjson d $((i - 31)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
+    gh search prs --author=@me --limit 1000 --created="$a..$b" --json url,createdAt | jq -c "$cap"' | {k: "opened", u: .url, t: .createdAt}'
+    gh search prs --author=@me --limit 1000 --merged-at="$a..$b" --json url,closedAt | jq -c "$cap"' | {k: "merged", u: .url, t: .closedAt}'
   done
 }
 
