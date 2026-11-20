@@ -66,6 +66,8 @@ These live in my global `CLAUDE.md`:
 
 - [`skills/`](skills): the skills I wrote. Drop a folder into `~/.claude/skills/`.
 - [`bin/astack-snapshot`](bin/astack-snapshot): the lockfile script.
+- [`bin/agent-stats`](bin/agent-stats): PRs, agent sessions and tokens for the
+  last 24 hours and 7 days. `--json` prints one line for a daily log.
 - [`statusline-command.sh`](statusline-command.sh): a status line showing
   directory, git branch, model and context use.
 

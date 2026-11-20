@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# agent-stats: what my agents did on this machine in the last 24 hours and 7 days.
+#   agent-stats          print a table
+#   agent-stats --json   print one JSON object (one line, for a daily log)
+# Sessions are transcript files written to inside the window. PR counts come
+# from GitHub, so they cover every machine; the rest covers this machine only.
+set -euo pipefail
+
+C="$HOME/.claude/projects" X="$HOME/.codex/sessions"
+
+# Transcript files written to in the last $2 minutes under dir $1; extra find args follow.
+files() { [ -d "$1" ] || return 0; find "$1" -name '*.jsonl' -mmin -"$2" "${@:3}"; }
+prs() { gh search prs --author=@me --limit 1000 --json number -q length "$@"; }
+
+window() {
+  local min=$1 since sessions subagents codex tokens opened merged
+  since=$(jq -nr --argjson m "$min" 'now - $m * 60 | todate')
+  sessions=$(files "$C" "$min" ! -path '*/subagents/*' | wc -l)
+  subagents=$(files "$C" "$min" -path '*/subagents/*' | wc -l)
+  codex=$(files "$X" "$min" | wc -l)
+  # One API reply is logged once per content block, so count each message.id once.
+  tokens=$(files "$C" "$min" -exec env LC_ALL=C sed -n '/"usage"/p' {} + |
+    jq -c --arg s "$since" 'select(.type == "assistant" and .timestamp >= $s and .message.usage) | {id: .message.id, u: .message.usage}' |
+    jq -s 'unique_by(.id) | map(.u) | {
+      output_tokens: (map(.output_tokens // 0) | add // 0),
+      input_tokens: (map((.input_tokens // 0) + (.cache_creation_input_tokens // 0)) | add // 0),
+      cache_read_tokens: (map(.cache_read_input_tokens // 0) | add // 0)}')
+  opened=$(prs --created=">=$since")
+  merged=$(prs --merged-at=">=$since")
+  jq -n --argjson t "$tokens" '{prs_opened: $ARGS.positional[0], prs_merged: $ARGS.positional[1],
+    claude_sessions: $ARGS.positional[2], claude_subagents: $ARGS.positional[3],
+    codex_sessions: $ARGS.positional[4]} + $t' --jsonargs "$opened" "$merged" "$sessions" "$subagents" "$codex"
+}
+
+json=$(jq -nc --arg host "$(hostname -s)" --argjson open "$(prs --state=open)" \
+  --argjson d "$(window 1440)" --argjson w "$(window 10080)" \
+  '{at: (now | todate), host: $host, open_prs: $open, "24h": $d, "7d": $w}')
+
+if [ "${1:-}" = "--json" ]; then echo "$json"; exit 0; fi
+jq -r '
+  def row($label; $k): [$label, (."24h"[$k] | tostring), (."7d"[$k] | tostring)] | @tsv;
+  (["Last", "24h", "7d"] | @tsv),
+  row("PRs opened"; "prs_opened"), row("PRs merged"; "prs_merged"),
+  row("Claude sessions"; "claude_sessions"), row("Claude subagents"; "claude_subagents"),
+  row("Codex sessions"; "codex_sessions"), row("Output tokens"; "output_tokens"),
+  row("Input tokens"; "input_tokens"), row("Cache-read tokens"; "cache_read_tokens"),
+  "PRs open now\t\(.open_prs)"' <<<"$json" | column -t -s $'\t'
