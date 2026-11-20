@@ -14,6 +14,7 @@ myself. My private repo (`astack`) holds the full setup.
 | Layer | What I use | What it does |
 |---|---|---|
 | Workspace | [T3 Code](https://github.com/pingdotgg/t3code) | Threads, git worktrees, subagents on several providers, scheduled tasks, PR tracking |
+| Terminal | [scripts](https://github.com/Anmolnoor/scripts): zsh, Oh My Zsh, Powerlevel10k, MesloLGS NF fonts | The prompt, plugins and git shortcuts, including `sum`/`cws`, which have Claude write the commit message for staged changes |
 | Agents | Claude Code, Codex | Write, review and ship code |
 | Process | [SoloFounder](https://github.com/solofounder-ai/solofounder) plugin | Turns every request into a short flow of stages with review gates |
 | Coding style | [Ponytail](https://github.com/DietrichGebert/ponytail) plugin, Karpathy-style guidelines | Smallest working change; think first, surgical diffs, verify |
@@ -58,8 +59,8 @@ These live in my global `CLAUDE.md`:
   It asks council only when there's a real decision, such as two skills
   that overlap or a breaking upgrade. I review every stack change before
   merging.
-- On a new machine: clone, run `install.sh`. It links the files and installs
-  every plugin in the lock.
+- On a new machine: clone, run `install.sh`. It links the files, installs
+  every plugin in the lock, and sets up the terminal from `scripts`.
 
 ## In this repo
 
