@@ -86,11 +86,11 @@ window() {
 
 machine() {
   set -e
-  local os cpus mem used up load page boot
+  local os cpus mem used up load page boot now
   if [ "$OS" = Darwin ]; then
     os="macOS $(sw_vers -productVersion)"; cpus=$(sysctl -n hw.ncpu); mem=$(sysctl -n hw.memsize); page=$(sysctl -n hw.pagesize)
     used=$(vm_stat | awk -v p="$page" '/Pages active|Pages wired|occupied by compressor/ {n += $NF} END {print n * p}')
-    boot=$(sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\).*/\1/'); up=$(( $(date +%s) - boot ))
+    boot=$(sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\).*/\1/'); now=$(date +%s); up=$((now - boot))
     load=$(sysctl -n vm.loadavg | awk '{print $2}')
   else
     os=$(. /etc/os-release && echo "$PRETTY_NAME"); cpus=$(nproc)
