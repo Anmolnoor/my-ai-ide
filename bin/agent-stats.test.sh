@@ -36,8 +36,6 @@ touch -t "$(jq -nr "$M + 60 | strftime(\"%Y%m%d%H%M\")")" "$T/home/.codex/sessio
 mkdir -p "$T/home/.codex/archived_sessions"
 echo '{"timestamp":"'"$(at "$OLD")"'","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":5},"last_token_usage":{"total_tokens":5}}}}' > "$T/home/.codex/archived_sessions/c3.jsonl"
 touch -t "$(jq -nr "$OLD | strftime(\"%Y%m%d%H%M\")")" "$T/home/.codex/archived_sessions/c3.jsonl"
-# The same session in both places (a restored backup, or archived mid-scan) counts once.
-cp -p "$T/home/.codex/archived_sessions/c3.jsonl" "$T/home/.codex/sessions/2026/"
 
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -81,6 +79,9 @@ s=$SECONDS; SEARCH_LEFT=5 SEARCH_RESET=$(($(date +%s) + 3)) run --days 4 >/dev/n
 [ $((SECONDS - s)) -ge 3 ] || { echo "FAIL: searched without waiting for the rate limit"; exit 1; }
 if QUOTA_FAIL=1 run --days 4 >/dev/null 2>&1; then echo "FAIL: a failed quota check was ignored"; exit 1; fi
 [ "$(run --days 4 --with box | wc -l)" -eq 8 ] || { echo "FAIL: --days --with"; exit 1; }
+# The same session in both places (a restored backup, or archived mid-scan) counts once.
+cp -p "$T/home/.codex/archived_sessions/c3.jsonl" "$T/home/.codex/sessions/2026/"
+out="$(run --json)"; check '."7d" | {codex_sessions, codex_tokens, agent_hours} == {codex_sessions:3, codex_tokens:195, agent_hours:0.6}'
 # An unreadable transcript must fail the run, not print partial totals.
 chmod 000 "$P/s1.jsonl"
 if run --json >/dev/null 2>&1; then echo "FAIL: a read error must fail the run"; exit 1; fi

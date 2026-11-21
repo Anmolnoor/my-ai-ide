@@ -126,9 +126,10 @@ stats() {
 # 30-day window's two searches can take 20. Below that, wait for the limit to reset.
 search_quota() {
   set -e
-  local q left reset
+  local q left reset now
   q=$(gh api rate_limit --jq '.resources.search | "\(.remaining) \(.reset)"'); read -r left reset <<<"$q"
-  if [ "$left" -lt 20 ]; then sleep $((reset > $(date +%s) ? reset - $(date +%s) + 1 : 1)); fi
+  now=$(date +%s)
+  if [ "$left" -lt 20 ]; then sleep $((reset > now ? reset - now + 1 : 1)); fi
 }
 
 # PRs opened and merged in the last $1 days, one JSON line {k, u, t} each. GitHub search
