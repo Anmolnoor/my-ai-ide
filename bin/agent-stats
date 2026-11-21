@@ -16,7 +16,8 @@ OS=$(uname -s)
 
 # Transcript files written to in the last $2 minutes under dir $1; extra find args follow.
 files() { [ -d "$1" ] || return 0; find "$1" -name '*.jsonl' -mmin -"$2" "${@:3}"; }
-# Codex moves a session it archives out of sessions/, so read both.
+# Codex moves a session it archives out of sessions/, so read both. A session is known by
+# its file name, so one found in both places (a restored backup, a move mid-scan) counts once.
 codex_files() { files "$X" "$@" && files "$XA" "$@"; }
 prs() { gh search prs --author=@me --limit 1000 --json number -q length "$@"; }
 ago() { jq -nr --argjson m "$1" 'now - $m * 60 | todate'; }
@@ -34,6 +35,7 @@ CALLS='index("\t") as $i | .[:$i] as $f | .[$i + 1:] | fromjson |
      in: (($u.input_tokens // 0) + ($u.cache_creation_input_tokens // 0)), cr: ($u.cache_read_input_tokens // 0)}
   elif .payload.type == "token_count" and .payload.info then
     # Codex logs a running total per turn, sometimes twice: key it by that total.
+    ($f | sub(".*/"; "")) as $f |
     {f: $f, ts: .timestamp, id: "\($f) \(.payload.info.total_token_usage.total_tokens)",
      codex: .payload.info.last_token_usage.total_tokens}
   else empty end'
@@ -83,7 +85,7 @@ window() {
   since=$(ago "$min")
   sessions=$(files "$C" "$min" ! -path '*/subagents/*' | wc -l)
   subagents=$(files "$C" "$min" -path '*/subagents/*' | wc -l)
-  codex=$(codex_files "$min" | wc -l)
+  codex=$(codex_files "$min" | sed 's|.*/||' | sort -u | wc -l)
   opened=$(prs --created=">=$since")
   merged=$(prs --merged-at=">=$since")
   h=$(health_events "$min" | jq -sc --arg os "$OS" "$HEALTH"'health($os)')
@@ -120,15 +122,23 @@ stats() {
     '{at: (now | todate), host: $host, machine: $m, open_prs: $open, "24h": ($d + $u."24h"), "7d": ($w + $u."7d")}'
 }
 
+# GitHub allows 30 search requests a minute, and gh asks 100 results per request, so a
+# 30-day window's two searches can take 20. Below that, wait for the limit to reset.
+search_quota() {
+  set -e
+  local q left reset
+  q=$(gh api rate_limit --jq '.resources.search | "\(.remaining) \(.reset)"'); read -r left reset <<<"$q"
+  if [ "$left" -lt 20 ]; then sleep $((reset > $(date +%s) ? reset - $(date +%s) + 1 : 1)); fi
+}
+
 # PRs opened and merged in the last $1 days, one JSON line {k, u, t} each. GitHub search
-# returns at most 1000 results and allows 30 searches a minute, so ask 30 days at a time
-# (overlapping; the caller dedupes), stop if a window hits the cap, and pause between windows
-# so a long backfill on two machines in a row stays under the rate limit.
+# returns at most 1000 results, so ask 30 days at a time (overlapping; the caller dedupes)
+# and stop if a window hits the cap.
 day_prs() {
   set -e
   local i a b cap='if length >= 1000 then error("a GitHub search hit its 1000-result cap; counts would be short") else .[] end'
   for ((i = $1; i > 0; i -= 30)); do
-    if [ "$i" -lt "$1" ]; then sleep 5; fi
+    search_quota
     a=$(jq -nr --argjson d $((i + 1)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
     b=$(jq -nr --argjson d $((i - 31)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
     gh search prs --author=@me --limit 1000 --created="$a..$b" --json url,createdAt | jq -c "$cap"' | {k: "opened", u: .url, t: .createdAt}'
