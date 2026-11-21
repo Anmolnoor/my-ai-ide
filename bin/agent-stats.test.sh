@@ -32,6 +32,10 @@ cat > "$T/home/.codex/sessions/2026/c2.jsonl" <<EOF
 {"timestamp":"$(at $((M + 60)))","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":40},"last_token_usage":{"total_tokens":40}}}}
 EOF
 touch -t "$(jq -nr "$M + 60 | strftime(\"%Y%m%d%H%M\")")" "$T/home/.codex/sessions/2026/c2.jsonl"
+# Codex moves archived sessions out of sessions/: count them too (7d only, same slot as m2).
+mkdir -p "$T/home/.codex/archived_sessions"
+echo '{"timestamp":"'"$(at "$OLD")"'","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":5},"last_token_usage":{"total_tokens":5}}}}' > "$T/home/.codex/archived_sessions/c3.jsonl"
+touch -t "$(jq -nr "$OLD | strftime(\"%Y%m%d%H%M\")")" "$T/home/.codex/archived_sessions/c3.jsonl"
 
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -51,7 +55,7 @@ check() { jq -e "$1" <<<"$out" >/dev/null || { echo "FAIL: $1"; echo "$out"; exi
 check '.open_prs == 2'
 # Slots: m1, m3 and the first Codex turn share one; the second Codex turn is the next.
 check '."24h" | del(.crashes, .oom_kills, .system_errors) == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:17, input_tokens:6, cache_read_tokens:100, codex_tokens:150, total_tokens:273, active_hours:0.2, agent_hours:0.3}'
-check '."7d"  | del(.crashes, .oom_kills, .system_errors) == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:2, output_tokens:37, input_tokens:8, cache_read_tokens:300, codex_tokens:190, total_tokens:535, active_hours:0.3, agent_hours:0.5}'
+check '."7d"  | del(.crashes, .oom_kills, .system_errors) == {prs_opened:4, prs_merged:3, claude_sessions:1, claude_subagents:1, codex_sessions:3, output_tokens:37, input_tokens:8, cache_read_tokens:300, codex_tokens:195, total_tokens:540, active_hours:0.3, agent_hours:0.6}'
 check '[."24h", ."7d"] | all(.crashes >= 0 and .oom_kills >= 0 and (.system_errors == null or .system_errors >= 0))'
 check '.machine | (.os | length > 0) and .cpus > 0 and .mem_total_gb > 0 and .mem_used_gb > 0 and .disk_free_gb > 0 and .uptime_hours > 0 and .load_1m >= 0'
 [ "$(run --with box --json | wc -l)" -eq 2 ] || { echo "FAIL: --with adds a line"; exit 1; }
@@ -61,8 +65,8 @@ days="$(run --days 4)"; D1=$(jq -nr "$T1 | strftime(\"%Y-%m-%d\")"); D3=$(jq -nr
 dcheck() { jq -se --arg d1 "$D1" --arg d3 "$D3" --arg dm "$DM" "$1" <<<"$days" >/dev/null || { echo "FAIL: $1"; echo "$days"; exit 1; }; }
 dcheck 'length == 4 and (map(.date) | unique | length) == 4 and all(.host | length > 0)'
 dcheck 'map(select(.date == $d1))[0] | del(.date, .host, .crashes, .oom_kills, .system_errors) == {prs_opened:1, prs_merged:1, claude_sessions:1, claude_subagents:1, codex_sessions:1, output_tokens:17, input_tokens:6, cache_read_tokens:100, codex_tokens:150, total_tokens:273, active_hours:0.2, agent_hours:0.3}'
-dcheck 'map(select(.date == $d3))[0] | {claude_sessions, claude_subagents, codex_sessions, output_tokens, total_tokens, active_hours} == {claude_sessions:1, claude_subagents:0, codex_sessions:0, output_tokens:20, total_tokens:222, active_hours:0.1}'
-dcheck 'map(.codex_tokens) | add == 190'
+dcheck 'map(select(.date == $d3))[0] | {claude_sessions, claude_subagents, codex_sessions, output_tokens, total_tokens, active_hours} == {claude_sessions:1, claude_subagents:0, codex_sessions:1, output_tokens:20, total_tokens:227, active_hours:0.1}'
+dcheck 'map(.codex_tokens) | add == 195'
 dcheck 'map(select(.date == $dm))[0].codex_tokens == 40'
 [ "$(run --days 40 | jq -s "map(.prs_opened) | add")" -eq 1 ] || { echo "FAIL: overlapping PR searches double-count"; exit 1; }
 for bad in 0 -1 x "" 10000; do if run --days "$bad" >/dev/null 2>&1; then echo "FAIL: --days '$bad' accepted"; exit 1; fi; done

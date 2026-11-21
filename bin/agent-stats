@@ -11,18 +11,20 @@
 # machine it runs on.
 set -euo pipefail
 
-C="$HOME/.claude/projects" X="$HOME/.codex/sessions" DAY=1440 WEEK=10080
+C="$HOME/.claude/projects" X="$HOME/.codex/sessions" XA="$HOME/.codex/archived_sessions" DAY=1440 WEEK=10080
 OS=$(uname -s)
 
 # Transcript files written to in the last $2 minutes under dir $1; extra find args follow.
 files() { [ -d "$1" ] || return 0; find "$1" -name '*.jsonl' -mmin -"$2" "${@:3}"; }
+# Codex moves a session it archives out of sessions/, so read both.
+codex_files() { files "$X" "$@" && files "$XA" "$@"; }
 prs() { gh search prs --author=@me --limit 1000 --json number -q length "$@"; }
 ago() { jq -nr --argjson m "$1" 'now - $m * 60 | todate'; }
 
 # One line per model call in the last $1 minutes (Claude replies, Codex turns), tagged with its file.
 events() {
   files "$C" "$1" -exec env LC_ALL=C awk 'index($0, "\"usage\"") {print FILENAME "\t" $0}' {} + &&
-  files "$X" "$1" -exec env LC_ALL=C awk 'index($0, "\"token_count\"") {print FILENAME "\t" $0}' {} +
+  codex_files "$1" -exec env LC_ALL=C awk 'index($0, "\"token_count\"") {print FILENAME "\t" $0}' {} +
 }
 # jq: one tagged line -> {f, ts, id, out, in, cr} for Claude or {f, ts, id, codex} for Codex.
 CALLS='index("\t") as $i | .[:$i] as $f | .[$i + 1:] | fromjson |
@@ -81,7 +83,7 @@ window() {
   since=$(ago "$min")
   sessions=$(files "$C" "$min" ! -path '*/subagents/*' | wc -l)
   subagents=$(files "$C" "$min" -path '*/subagents/*' | wc -l)
-  codex=$(files "$X" "$min" | wc -l)
+  codex=$(codex_files "$min" | wc -l)
   opened=$(prs --created=">=$since")
   merged=$(prs --merged-at=">=$since")
   h=$(health_events "$min" | jq -sc --arg os "$OS" "$HEALTH"'health($os)')
@@ -120,11 +122,13 @@ stats() {
 
 # PRs opened and merged in the last $1 days, one JSON line {k, u, t} each. GitHub search
 # returns at most 1000 results and allows 30 searches a minute, so ask 30 days at a time
-# (overlapping; the caller dedupes) and stop if a window hits the cap.
+# (overlapping; the caller dedupes), stop if a window hits the cap, and pause between windows
+# so a long backfill on two machines in a row stays under the rate limit.
 day_prs() {
   set -e
   local i a b cap='if length >= 1000 then error("a GitHub search hit its 1000-result cap; counts would be short") else .[] end'
   for ((i = $1; i > 0; i -= 30)); do
+    if [ "$i" -lt "$1" ]; then sleep 5; fi
     a=$(jq -nr --argjson d $((i + 1)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
     b=$(jq -nr --argjson d $((i - 31)) 'now - $d * 86400 | strftime("%Y-%m-%d")')
     gh search prs --author=@me --limit 1000 --created="$a..$b" --json url,createdAt | jq -c "$cap"' | {k: "opened", u: .url, t: .createdAt}'
